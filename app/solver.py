@@ -14,12 +14,22 @@ from .errors import NonConvergenceError
 
 _BRACKET_EXPANSION_LIMIT = 60
 
+# 点/线热源是连续介质模型在热源尺度被忽略时的理想化结果。在这个半径以内，
+# 有限峰值会随横向距离按 1/ρ（薄板为对数发散）失控增大，已不能作为有物理
+# 意义的峰值；因而不能只靠 rho == 0.0 判断奇点。
+NUMERICAL_SOURCE_RADIUS = 1e-8  # 输入坐标采用 SI 长度（m）
+# 寻峰采样若已经达到十万开量级，说明优化正在沿 1/R 奇点外沿爬升，
+# 该值只能作为发散判据，绝不能作为正式峰值返回。
+RUNAWAY_RISE_LIMIT = 1.0e5
+SINGULAR_REASON = "寻峰进入理想化点/线热源的奇点邻域，峰值温度数学上无界"
+
 
 @dataclass(frozen=True)
 class PeakResult:
     x: float | None  # 峰值位置（singular 时无意义）
     rise: float | None  # 峰值温升（singular 时为 None）
-    singular: bool  # 观察线穿过热源奇点，峰值无界
+    singular: bool  # 观察线进入理想化热源奇点邻域，峰值无界
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -28,19 +38,32 @@ class MeltResult:
     half_width: float | None  # 横向熔化边界 |y*|；未形成熔池时为 None
 
 
+def _is_runaway_rise(value: float) -> bool:
+    return not math.isfinite(value) or value >= RUNAWAY_RISE_LIMIT
+
+
+def _singular_peak() -> PeakResult:
+    return PeakResult(x=None, rise=None, singular=True, reason=SINGULAR_REASON)
+
+
 def _golden_section_max(
     f: Callable[[float], float], a: float, b: float, xtol: float, max_iter: int
-) -> tuple[float, float]:
-    """在 [a, b] 上求单峰函数 f 的最大值点（黄金分割搜索）。"""
+) -> tuple[float, float] | None:
+    """在 [a, b] 上求单峰函数 f 的最大值点；采样进入发散区则返回 None。"""
     scale = abs(b - a) or 1.0
     gr = (math.sqrt(5.0) - 1.0) / 2.0
     c = b - gr * (b - a)
     d = a + gr * (b - a)
     fc, fd = f(c), f(d)
+    if _is_runaway_rise(fc) or _is_runaway_rise(fd):
+        return None
     for _ in range(max_iter):
         if abs(b - a) <= xtol * scale:
             x = 0.5 * (a + b)
-            return x, f(x)
+            fx = f(x)
+            if _is_runaway_rise(fx):
+                return None
+            return x, fx
         if fc < fd:
             a, c, fc = c, d, fd
             d = a + gr * (b - a)
@@ -49,6 +72,8 @@ def _golden_section_max(
             b, d, fd = d, c, fc
             c = b - gr * (b - a)
             fc = f(c)
+        if _is_runaway_rise(fc) or _is_runaway_rise(fd):
+            return None
     raise NonConvergenceError(
         f"峰值一维搜索在 {max_iter} 步内未收敛"
         f"（当前区间宽度 {abs(b - a):.3e}，目标 {xtol * scale:.3e}）"
@@ -62,21 +87,30 @@ def scan_peak(
 
     field 为只随 x 变化的温升函数；rho 为观察线到焊道中线的距离
     （厚板 √(y²+z²)，薄板 |y|）；lam = v/(2α)。
-    rho = 0 时观察线穿过热源奇点，峰值无界，标记 singular。
+    rho 位于理想化热源的数值奇点邻域时，峰值无界，标记 singular。
+    这里必须包含“极小但非零”的偏移：否则一维优化会在发散途中捞到一个
+    有限但不具物理意义的中间值并误报为峰值。
     """
     if q == 0.0:
         return PeakResult(x=0.0, rise=0.0, singular=False)
-    if rho == 0.0:
-        return PeakResult(x=None, rise=None, singular=True)
+    if rho <= NUMERICAL_SOURCE_RADIUS:
+        return _singular_peak()
     # 峰值位于热源后方 x* ≈ -λρ²/2 附近；给出覆盖性左端点，必要时向外扩张
     a = -(4.0 * lam * rho * rho + 4.0 * rho + 1e-12)
     for _ in range(_BRACKET_EXPANSION_LIMIT):
-        if field(0.5 * a) >= field(a):
+        f_mid = field(0.5 * a)
+        f_left = field(a)
+        if _is_runaway_rise(f_mid) or _is_runaway_rise(f_left):
+            return _singular_peak()
+        if f_mid >= f_left:
             break
         a *= 2.0
     else:
         raise NonConvergenceError("峰值搜索无法在给定步数内围住极大值点（区间扩张失败）")
-    x_star, f_star = _golden_section_max(field, a, 0.0, xtol, max_iter)
+    found = _golden_section_max(field, a, 0.0, xtol, max_iter)
+    if found is None:
+        return _singular_peak()
+    x_star, f_star = found
     return PeakResult(x=x_star, rise=f_star, singular=False)
 
 

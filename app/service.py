@@ -8,7 +8,13 @@ from collections.abc import Callable
 from .physics import thick as thick_field
 from .physics import thin as thin_field
 from .schemas import PointInput, SolverOptions
-from .solver import PeakResult, estimate_melt_width, scan_peak
+from .solver import (
+    NUMERICAL_SOURCE_RADIUS,
+    RUNAWAY_RISE_LIMIT,
+    PeakResult,
+    estimate_melt_width,
+    scan_peak,
+)
 from .validation import THICK, Process
 
 
@@ -45,10 +51,17 @@ def calculate(
     lam = proc.travel_speed / (2.0 * proc.diffusivity)
     z = point.z if proc.mode == THICK else None
 
-    # 观察点温升
+    # 观察点温升。点源/线源公式只在热源尺度之外有效；进入数值奇点邻域时，
+    # 不能把 1/R 的巨大中间值当作正式温度。
     field_at_point, rho = _field_and_rho(proc, point.y, z)
-    rise = field_at_point(point.x)
-    point_singular = math.isinf(rise)
+    point_radius = math.hypot(point.x, rho)
+    near_source = q > 0.0 and point_radius <= NUMERICAL_SOURCE_RADIUS
+    rise = None if near_source else field_at_point(point.x)
+    point_singular = near_source or (
+        rise is not None and (not math.isfinite(rise) or rise >= RUNAWAY_RISE_LIMIT)
+    )
+    if point_singular:
+        rise = None
 
     # 沿 x 的峰值温度（观察点所在的 y、z 处）
     peak = scan_peak(
@@ -100,18 +113,24 @@ def calculate(
             "x": point.x,
             "y": point.y,
             "z": z,
-            "temperature_rise": None if point_singular else rise,
+            "temperature_rise": rise,
             "temperature": None if point_singular else t0 + rise,
             "singular": point_singular,
+            "reason": (
+                "观察点进入理想化点/线热源的奇点邻域，温度数学上无界（或已数值失控）"
+                if point_singular
+                else None
+            ),
         },
         "peak": {
             "x": peak.x,
             "temperature_rise": peak.rise,
             "temperature": None if peak.singular else t0 + peak.rise,
             "singular": peak.singular,
+            "reason": peak.reason,
         },
         "melt_pool": melt_payload,
     }
     if peak.singular:
-        result["peak"]["note"] = "移动热源理想化解在热源正后方中线上发散，峰值温度无界（奇点）"
+        result["peak"]["note"] = "移动热源理想化解在热源奇点邻域内发散，峰值温度无界"
     return result

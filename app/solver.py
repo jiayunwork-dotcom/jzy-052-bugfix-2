@@ -14,12 +14,21 @@ from .errors import NonConvergenceError
 
 _BRACKET_EXPANSION_LIMIT = 60
 
+# 点源/线源解在热源处发散：rho 越接近零，峰值温升沿 1/rho（薄板为对数）
+# 曲线冲得越高。rho 严格为零只是这条发散曲线的极限——rho 即使只差 1e-9，
+# 峰值温升同样会冲到任何物理过程都不可能达到的量级，此时模型输出已脱离
+# 物理意义，必须与 rho = 0 一样按奇点处理，不能把发散途中的中间值当成
+# 正式结果。真实焊接电弧等离子体也不过 1e4 K 量级，这里取 1e6 K 为温升
+# 上限并留出两个数量级余量；正常观察距离（毫米量级、千瓦级功率）的峰值
+# 温升仅在 1e3–1e4 K，不会被误伤。
+MAX_PHYSICAL_RISE = 1e6  # K；温升的物理上限，越过即按奇点处理
+
 
 @dataclass(frozen=True)
 class PeakResult:
     x: float | None  # 峰值位置（singular 时无意义）
     rise: float | None  # 峰值温升（singular 时为 None）
-    singular: bool  # 观察线穿过热源奇点，峰值无界
+    singular: bool  # 观察线穿过或紧贴热源奇点（峰值探入发散区），峰值无界
 
 
 @dataclass(frozen=True)
@@ -62,7 +71,9 @@ def scan_peak(
 
     field 为只随 x 变化的温升函数；rho 为观察线到焊道中线的距离
     （厚板 √(y²+z²)，薄板 |y|）；lam = v/(2α)。
-    rho = 0 时观察线穿过热源奇点，峰值无界，标记 singular。
+    rho = 0 时观察线穿过热源奇点，峰值无界，标记 singular；rho 非零但
+    峰值温升仍越过 MAX_PHYSICAL_RISE 时，观察线同样已探入奇点发散区，
+    也标记 singular，绝不把发散途中的中间值当成峰值返回。
     """
     if q == 0.0:
         return PeakResult(x=0.0, rise=0.0, singular=False)
@@ -77,6 +88,9 @@ def scan_peak(
     else:
         raise NonConvergenceError("峰值搜索无法在给定步数内围住极大值点（区间扩张失败）")
     x_star, f_star = _golden_section_max(field, a, 0.0, xtol, max_iter)
+    if not math.isfinite(f_star) or f_star > MAX_PHYSICAL_RISE:
+        # 峰值已探入奇点发散区：与 rho = 0 一样按奇点处理
+        return PeakResult(x=None, rise=None, singular=True)
     return PeakResult(x=x_star, rise=f_star, singular=False)
 
 

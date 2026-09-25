@@ -8,7 +8,7 @@ from collections.abc import Callable
 from .physics import thick as thick_field
 from .physics import thin as thin_field
 from .schemas import PointInput, SolverOptions
-from .solver import PeakResult, estimate_melt_width, scan_peak
+from .solver import MAX_PHYSICAL_RISE, PeakResult, estimate_melt_width, scan_peak
 from .validation import THICK, Process
 
 
@@ -45,10 +45,11 @@ def calculate(
     lam = proc.travel_speed / (2.0 * proc.diffusivity)
     z = point.z if proc.mode == THICK else None
 
-    # 观察点温升
+    # 观察点温升；温升非有限或越过物理上限（紧贴热源奇点）时按奇点处理，
+    # 与坐标严格落在热源上（温升 inf）走同一条路径
     field_at_point, rho = _field_and_rho(proc, point.y, z)
     rise = field_at_point(point.x)
-    point_singular = math.isinf(rise)
+    point_singular = not math.isfinite(rise) or rise > MAX_PHYSICAL_RISE
 
     # 沿 x 的峰值温度（观察点所在的 y、z 处）
     peak = scan_peak(
